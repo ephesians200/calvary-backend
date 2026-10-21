@@ -1,0 +1,21 @@
+name = "church-backend"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+[vars]
+# Custom URL scheme the Android app registers (see AndroidManifest.xml)
+APP_SCHEME = "calvarytemple"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "calvary-db"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "calvary-media"
+
+# Secrets (never commit these) - set with `wrangler secret put <NAME>`:
+#   JWT_SECRET                long random string (32+ bytes)
+#   PAYSTACK_SECRET_KEY       sk_live_... / sk_test_...
+#   FCM_SERVICE_ACCOUNT_JSON  full Firebase service-account JSON (one line)

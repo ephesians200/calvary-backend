@@ -1,0 +1,16 @@
+{
+  "name": "calvary-temple-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute calvary-db --remote --file=./schema.sql",
+    "db:init:local": "wrangler d1 execute calvary-db --local --file=./schema.sql",
+    "test": "node scripts/selftest.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
