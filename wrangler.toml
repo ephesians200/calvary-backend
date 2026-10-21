@@ -9,7 +9,7 @@ APP_SCHEME = "calvarytemple"
 [[d1_databases]]
 binding = "DB"
 database_name = "calvary-db"
-database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+database_id = "3d6ba66d-f2c0-4103-995b-821b305535d8"
 
 [[r2_buckets]]
 binding = "MEDIA"
