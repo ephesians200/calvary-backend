@@ -14,6 +14,7 @@ database_id = "3d6ba66d-f2c0-4103-995b-821b305535d8"
 [[r2_buckets]]
 binding = "MEDIA"
 bucket_name = "calvary-media"
+workers_dev = true
 
 # Secrets (never commit these) - set with `wrangler secret put <NAME>`:
 #   JWT_SECRET                long random string (32+ bytes)
