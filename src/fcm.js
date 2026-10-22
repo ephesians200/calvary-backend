@@ -41,7 +41,7 @@ async function accessToken(sa) {
  * onMessageReceived() in the app (even in the background), so the app can refresh its cache
  * and show the notification on its own channel.
  */
-export async function sendTopicPush(env, { title, body, topic = 'announcements' }) {
+export async function sendTopicPush(env, { title, body, type = 'announcement', topic = 'announcements' }) {
   if (!env.FCM_SERVICE_ACCOUNT_JSON) return { skipped: true };
   const sa = JSON.parse(env.FCM_SERVICE_ACCOUNT_JSON);
   const token = await accessToken(sa);
@@ -51,7 +51,7 @@ export async function sendTopicPush(env, { title, body, topic = 'announcements' 
     body: JSON.stringify({
       message: {
         topic,
-        data: { type: 'announcement', title: title.slice(0, 100), body: body.slice(0, 300) },
+        data: { type, title: title.slice(0, 100), body: body.slice(0, 300) },
         android: { priority: 'HIGH' },
       },
     }),

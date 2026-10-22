@@ -2,6 +2,7 @@ import { json, fail, readJson, clean, randomHex } from './util.js';
 import { hashPassword, verifyPassword, signJwt, requireAdmin } from './auth.js';
 import { initializeTransaction, verifyTransaction, verifyWebhookSignature } from './paystack.js';
 import { sendTopicPush } from './fcm.js';
+import { portalRoute } from './portal.js';
 
 const CATEGORIES = ['General', 'Service', 'Event', 'Prayer', 'Youth', 'Women', 'Men', 'Children'];
 const FUNDS = ['Offering', 'Tithe', 'Missions', 'Building'];
@@ -47,19 +48,24 @@ async function route(request, env, ctx) {
   if (method === 'GET' && pathname.startsWith('/api/payments/')) return paymentStatus(env, pathname.slice('/api/payments/'.length));
   if (m('GET', '/pay/return')) return payReturn(url, env);
 
+  // ---- members, prayer, testimonies, calendar, pastor words (handles its own auth) ----
+  const portal = await portalRoute(request, env, ctx, url);
+  if (portal) return portal;
+
   // ---- admin (JWT + active admin row required) ----
-  const isAdminRoute = pathname.startsWith('/api/admin/') || m('POST', '/api/announcements') ||
-    (method === 'DELETE' && pathname.startsWith('/api/announcements/'));
+  const isAnnouncementEdit = (method === 'PUT' || method === 'DELETE') && pathname.startsWith('/api/announcements/');
+  const isAdminRoute = pathname.startsWith('/api/admin/') || m('POST', '/api/announcements') || isAnnouncementEdit;
   if (isAdminRoute) {
     const admin = await requireAdmin(request, env);
     if (!admin) return fail('Unauthorized', 401);
 
     if (m('POST', '/api/announcements')) return createAnnouncement(request, env, ctx, admin);
-    if (method === 'DELETE') return deleteAnnouncement(env, pathname.split('/').pop());
+    if (method === 'DELETE' && isAnnouncementEdit) return deleteAnnouncement(env, pathname.split('/').pop());
+    if (method === 'PUT' && isAnnouncementEdit) return updateAnnouncement(request, env, pathname.split('/').pop());
     if (m('GET', '/api/admin/stats')) return stats(env);
     if (m('POST', '/api/admin/media/multipart/start')) return uploadStart(request, env);
     if (m('PUT', '/api/admin/media/multipart/part')) return uploadPart(request, env, url);
-    if (m('POST', '/api/admin/media/multipart/complete')) return uploadComplete(request, env, admin);
+    if (m('POST', '/api/admin/media/multipart/complete')) return uploadComplete(request, env, ctx, admin);
     if (m('POST', '/api/admin/media/multipart/abort')) return uploadAbort(request, env);
   }
 
@@ -124,6 +130,20 @@ async function createAnnouncement(request, env, ctx, admin) {
 
   ctx.waitUntil(sendTopicPush(env, { title, body: text }).catch((e) => console.error('push failed', e.message)));
   return json({ success: true, message: 'Announcement posted', id: res.meta.last_row_id }, 201);
+}
+
+async function updateAnnouncement(request, env, idStr) {
+  const id = Number(idStr);
+  if (!Number.isInteger(id)) return fail('Invalid id');
+  const body = await readJson(request);
+  const title = clean(body?.title, 120);
+  const text = clean(body?.body, 2000);
+  const category = CATEGORIES.includes(body?.category) ? body.category : 'General';
+  if (!title || !text) return fail('Title and message are required');
+  const res = await env.DB.prepare('UPDATE announcements SET title = ?, body = ?, category = ?, updated_at = ? WHERE id = ? AND deleted = 0')
+    .bind(title, text, category, Date.now(), id).run();
+  if (!res.meta.changes) return fail('Not found', 404);
+  return json({ success: true, message: 'Announcement updated' });
 }
 
 async function deleteAnnouncement(env, idStr) {
@@ -204,7 +224,7 @@ async function uploadPart(request, env, url) {
   return json({ success: true, partNumber: part.partNumber, etag: part.etag });
 }
 
-async function uploadComplete(request, env, admin) {
+async function uploadComplete(request, env, ctx, admin) {
   const body = await readJson(request, 200_000);
   const key = body?.key;
   const kind = body?.kind;
@@ -221,6 +241,8 @@ async function uploadComplete(request, env, admin) {
   await env.DB.prepare(
     'INSERT INTO media (kind, title, speaker, object_key, content_type, size, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
   ).bind(kind, title, clean(body.speaker, 80) || null, key, obj.httpMetadata?.contentType || 'application/octet-stream', obj.size, admin.id, Date.now()).run();
+  const label = kind === 'sermon' ? 'New sermon uploaded' : 'New flyer uploaded';
+  ctx.waitUntil(sendTopicPush(env, { type: 'media', title: label, body: title }).catch((e) => console.error('push failed', e.message)));
   return json({ success: true, message: 'Upload complete' }, 201);
 }
 
