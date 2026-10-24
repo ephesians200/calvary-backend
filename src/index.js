@@ -45,7 +45,7 @@ async function route(request, env, ctx) {
   if (m('GET', '/api/announcements')) return listAnnouncements(request, env);
   if (m('GET', '/api/media')) return listMedia(url, env);
   if (method === 'GET' && pathname.startsWith('/media/')) return serveMedia(request, env, pathname.slice(7));
-  if (method === 'GET' && pathname.startsWith('/watch/')) return watchLink(env, pathname.slice(7));
+  if (method === 'GET' && pathname.startsWith('/watch/')) return watchLink(env, pathname.slice(7), url.origin);
   if (m('POST', '/api/auth/login')) return login(request, env);
   if (m('POST', '/api/payments/init')) return initPayment(request, env, url);
   if (m('POST', '/api/paystack/webhook')) return paystackWebhook(request, env);
@@ -73,6 +73,7 @@ async function route(request, env, ctx) {
     if (m('GET', '/api/admin/stats')) return stats(env, admin);
     if (pathname.startsWith('/api/admin/media/')) {
       if ((denied = need('upload'))) return denied;
+      if (method === 'DELETE' && /^\/api\/admin\/media\/\d+$/.test(pathname)) return deleteMedia(env, pathname.split('/').pop());
       if (m('POST', '/api/admin/media/link')) return addLink(request, env, ctx, admin);
       if (m('POST', '/api/admin/media/multipart/start')) return uploadStart(request, env);
       if (m('PUT', '/api/admin/media/multipart/part')) return uploadPart(request, env, url);
@@ -192,15 +193,27 @@ async function listMedia(url, env) {
   const items = results.map(({ objectKey, ...r }) => (r.source === 'link'
     ? { ...r, url: r.link, watchUrl: `${url.origin}/watch/${r.id}` }
     : { ...r, url: `${url.origin}/media/${objectKey}`, watchUrl: '' }));
-  return json({ success: true, items }, 200, { 'cache-control': 'public, max-age=60' });
+  // no-cache: a deleted item must disappear from members' phones straight away.
+  return json({ success: true, items }, 200, { 'cache-control': 'no-cache' });
 }
 
-async function watchLink(env, idStr) {
+async function deleteMedia(env, idStr) {
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id < 1) return fail('Invalid id');
+  const row = await env.DB.prepare('SELECT object_key, source FROM media WHERE id = ?').bind(id).first();
+  if (!row) return fail('Not found', 404);
+  // Uploaded files live in R2; links only exist as a database row.
+  if (row.source !== 'link') await env.MEDIA.delete(row.object_key);
+  await env.DB.prepare('DELETE FROM media WHERE id = ?').bind(id).run();
+  return json({ success: true, message: 'Deleted' });
+}
+
+async function watchLink(env, idStr, origin) {
   const id = Number(idStr);
   if (!Number.isInteger(id) || id < 1) return fail('Not found', 404);
   const row = await env.DB.prepare("SELECT title, link_url FROM media WHERE id = ? AND source = 'link'").bind(id).first();
   if (!row) return fail('Not found', 404);
-  return watchPage(row.title, row.link_url);
+  return watchPage(row.title, row.link_url, origin);
 }
 
 async function addLink(request, env, ctx, admin) {
@@ -209,7 +222,7 @@ async function addLink(request, env, ctx, admin) {
   const link = clean(body?.link, 500);
   if (!title) return fail('A title is required');
   const parsed = parseVideoLink(link);
-  if (!parsed) return fail('Use an https link from YouTube, Facebook, Vimeo or Instagram, or a direct .mp4 link');
+  if (!parsed) return fail('Use an https link from YouTube, Facebook, Instagram, Vimeo, TikTok, Dailymotion or Google Drive, or a direct .mp4 link');
   await env.DB.prepare(
     `INSERT INTO media (kind, title, speaker, object_key, content_type, size, source, link_url, created_by, created_at)
      VALUES ('sermon', ?, ?, ?, 'text/uri-list', 0, 'link', ?, ?, ?)`,
