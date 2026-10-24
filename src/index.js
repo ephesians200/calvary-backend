@@ -1,18 +1,21 @@
 import { json, fail, readJson, clean, randomHex } from './util.js';
-import { hashPassword, verifyPassword, signJwt, requireAdmin } from './auth.js';
+import { hashPassword, verifyPassword, signJwt, requireAdmin, can, parsePermissions } from './auth.js';
 import { initializeTransaction, verifyTransaction, verifyWebhookSignature } from './paystack.js';
 import { sendTopicPush } from './fcm.js';
 import { portalRoute } from './portal.js';
+import { usersRoute } from './users.js';
+import { watchPage, parseVideoLink } from './watch.js';
 
 const CATEGORIES = ['General', 'Service', 'Event', 'Prayer', 'Youth', 'Women', 'Men', 'Children'];
 const FUNDS = ['Offering', 'Tithe', 'Missions', 'Building'];
 const EXT = {
   'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/mp4a-latm': 'm4a', 'audio/aac': 'aac',
   'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/ogg': 'ogg', 'audio/webm': 'webm',
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/3gpp': '3gp', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/x-m4v': 'm4v',
   'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
 };
 const MAX_PART_BYTES = 16 * 1024 * 1024;
-const MAX_MEDIA_BYTES = 300 * 1024 * 1024;
+const MAX_MEDIA_BYTES = 500 * 1024 * 1024;
 const KEY_RE = /^(sermon|flyer)\/[A-Za-z0-9._-]{1,120}$/;
 const REF_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
@@ -42,6 +45,7 @@ async function route(request, env, ctx) {
   if (m('GET', '/api/announcements')) return listAnnouncements(request, env);
   if (m('GET', '/api/media')) return listMedia(url, env);
   if (method === 'GET' && pathname.startsWith('/media/')) return serveMedia(request, env, pathname.slice(7));
+  if (method === 'GET' && pathname.startsWith('/watch/')) return watchLink(env, pathname.slice(7));
   if (m('POST', '/api/auth/login')) return login(request, env);
   if (m('POST', '/api/payments/init')) return initPayment(request, env, url);
   if (m('POST', '/api/paystack/webhook')) return paystackWebhook(request, env);
@@ -59,14 +63,25 @@ async function route(request, env, ctx) {
     const admin = await requireAdmin(request, env);
     if (!admin) return fail('Unauthorized', 401);
 
-    if (m('POST', '/api/announcements')) return createAnnouncement(request, env, ctx, admin);
-    if (method === 'DELETE' && isAnnouncementEdit) return deleteAnnouncement(env, pathname.split('/').pop());
-    if (method === 'PUT' && isAnnouncementEdit) return updateAnnouncement(request, env, pathname.split('/').pop());
-    if (m('GET', '/api/admin/stats')) return stats(env);
-    if (m('POST', '/api/admin/media/multipart/start')) return uploadStart(request, env);
-    if (m('PUT', '/api/admin/media/multipart/part')) return uploadPart(request, env, url);
-    if (m('POST', '/api/admin/media/multipart/complete')) return uploadComplete(request, env, ctx, admin);
-    if (m('POST', '/api/admin/media/multipart/abort')) return uploadAbort(request, env);
+    const need = (perm) => (can(admin, perm) ? null : fail('You do not have access to this', 403));
+    let denied;
+
+    if (m('POST', '/api/announcements')) return need('notice') || createAnnouncement(request, env, ctx, admin);
+    if (method === 'DELETE' && isAnnouncementEdit) return need('announcements') || deleteAnnouncement(env, pathname.split('/').pop());
+    if (method === 'PUT' && isAnnouncementEdit) return need('announcements') || updateAnnouncement(request, env, pathname.split('/').pop());
+    if (m('GET', '/api/admin/me')) return json({ success: true, name: admin.name, role: admin.role, permissions: admin.permissions });
+    if (m('GET', '/api/admin/stats')) return stats(env, admin);
+    if (pathname.startsWith('/api/admin/media/')) {
+      if ((denied = need('upload'))) return denied;
+      if (m('POST', '/api/admin/media/link')) return addLink(request, env, ctx, admin);
+      if (m('POST', '/api/admin/media/multipart/start')) return uploadStart(request, env);
+      if (m('PUT', '/api/admin/media/multipart/part')) return uploadPart(request, env, url);
+      if (m('POST', '/api/admin/media/multipart/complete')) return uploadComplete(request, env, ctx, admin);
+      if (m('POST', '/api/admin/media/multipart/abort')) return uploadAbort(request, env);
+    }
+    if (pathname === '/api/admin/users' || pathname.startsWith('/api/admin/users/')) {
+      return need('users') || usersRoute(request, env, admin, pathname);
+    }
   }
 
   return fail('Not found', 404);
@@ -87,7 +102,7 @@ async function login(request, env) {
     .bind(key, now - LOGIN_WINDOW_MS).first();
   if (c >= MAX_LOGIN_FAILURES) return fail('Too many attempts. Try again in 15 minutes.', 429);
 
-  const admin = await env.DB.prepare('SELECT id, name, role, password_hash FROM admins WHERE username = ? AND active = 1').bind(username).first();
+  const admin = await env.DB.prepare('SELECT id, name, role, password_hash, permissions FROM admins WHERE username = ? AND active = 1').bind(username).first();
   // Always run a hash so response time doesn't reveal whether the username exists.
   const ok = admin
     ? await verifyPassword(password, admin.password_hash)
@@ -99,7 +114,7 @@ async function login(request, env) {
   }
   await env.DB.prepare('DELETE FROM login_attempts WHERE key = ?').bind(key).run();
   const { token, expiresAt } = await signJwt({ sub: admin.id, name: admin.name, role: admin.role }, env.JWT_SECRET);
-  return json({ success: true, token, name: admin.name, role: admin.role, expiresAt });
+  return json({ success: true, token, name: admin.name, role: admin.role, permissions: parsePermissions(admin.permissions), expiresAt });
 }
 
 // ================= announcements =================
@@ -153,7 +168,7 @@ async function deleteAnnouncement(env, idStr) {
   return json({ success: true });
 }
 
-async function stats(env) {
+async function stats(env, admin) {
   const q = (sql) => env.DB.prepare(sql).first();
   const [a, s, f, g] = await Promise.all([
     q('SELECT COUNT(*) AS n FROM announcements WHERE deleted = 0'),
@@ -161,7 +176,8 @@ async function stats(env) {
     q("SELECT COUNT(*) AS n FROM media WHERE kind = 'flyer'"),
     q("SELECT COUNT(*) AS n FROM payments WHERE status = 'success'"),
   ]);
-  return json({ success: true, announcements: a.n, sermons: s.n, flyers: f.n, gifts: g.n });
+  // The gifts figure is financial, so only full-access admins receive it.
+  return json({ success: true, announcements: a.n, sermons: s.n, flyers: f.n, gifts: admin.permissions.includes('*') ? g.n : 0 });
 }
 
 // ================= media (R2) =================
@@ -169,10 +185,37 @@ async function listMedia(url, env) {
   const kind = url.searchParams.get('kind');
   if (kind !== 'sermon' && kind !== 'flyer') return fail('kind must be sermon or flyer');
   const { results } = await env.DB.prepare(
-    'SELECT id, kind, title, COALESCE(speaker, \'\') AS speaker, object_key AS objectKey, created_at AS createdAt FROM media WHERE kind = ? ORDER BY created_at DESC LIMIT 100',
+    `SELECT id, kind, title, COALESCE(speaker, '') AS speaker, object_key AS objectKey, content_type AS contentType, size,
+            source, COALESCE(link_url, '') AS link, created_at AS createdAt
+     FROM media WHERE kind = ? ORDER BY created_at DESC LIMIT 100`,
   ).bind(kind).all();
-  const items = results.map((r) => ({ ...r, url: `${url.origin}/media/${r.objectKey}` }));
+  const items = results.map(({ objectKey, ...r }) => (r.source === 'link'
+    ? { ...r, url: r.link, watchUrl: `${url.origin}/watch/${r.id}` }
+    : { ...r, url: `${url.origin}/media/${objectKey}`, watchUrl: '' }));
   return json({ success: true, items }, 200, { 'cache-control': 'public, max-age=60' });
+}
+
+async function watchLink(env, idStr) {
+  const id = Number(idStr);
+  if (!Number.isInteger(id) || id < 1) return fail('Not found', 404);
+  const row = await env.DB.prepare("SELECT title, link_url FROM media WHERE id = ? AND source = 'link'").bind(id).first();
+  if (!row) return fail('Not found', 404);
+  return watchPage(row.title, row.link_url);
+}
+
+async function addLink(request, env, ctx, admin) {
+  const body = await readJson(request);
+  const title = clean(body?.title, 120);
+  const link = clean(body?.link, 500);
+  if (!title) return fail('A title is required');
+  const parsed = parseVideoLink(link);
+  if (!parsed) return fail('Use an https link from YouTube, Facebook, Vimeo or Instagram, or a direct .mp4 link');
+  await env.DB.prepare(
+    `INSERT INTO media (kind, title, speaker, object_key, content_type, size, source, link_url, created_by, created_at)
+     VALUES ('sermon', ?, ?, ?, 'text/uri-list', 0, 'link', ?, ?, ?)`,
+  ).bind(title, clean(body?.speaker, 80) || null, `link/${Date.now()}-${randomHex(8)}`, link, admin.id, Date.now()).run();
+  ctx.waitUntil(sendTopicPush(env, { type: 'media', title: 'New video posted', body: title }).catch((e) => console.error('push failed', e.message)));
+  return json({ success: true, message: 'Link added' }, 201);
 }
 
 async function serveMedia(request, env, key) {
@@ -204,7 +247,8 @@ async function uploadStart(request, env) {
   const contentType = clean(body?.contentType, 100).toLowerCase();
   const ext = EXT[contentType];
   if ((kind !== 'sermon' && kind !== 'flyer') || !ext) return fail('Unsupported file type');
-  if ((kind === 'sermon') !== contentType.startsWith('audio/')) return fail('File type does not match upload kind');
+  const isImage = contentType.startsWith('image/');
+  if ((kind === 'flyer') !== isImage) return fail('File type does not match upload kind');
 
   const key = `${kind}/${Date.now()}-${randomHex(8)}.${ext}`;
   const upload = await env.MEDIA.createMultipartUpload(key, { httpMetadata: { contentType } });
@@ -264,6 +308,7 @@ async function initPayment(request, env, url) {
   if (!EMAIL_RE.test(email)) return fail('A valid email is required for your receipt');
   if (!fundType) return fail('Choose what you are giving towards');
 
+  if (!String(env.PAYSTACK_SECRET_KEY || '').trim()) return fail('Payments are not set up on the server yet (missing PAYSTACK_SECRET_KEY).', 503);
   const reference = `CT-${randomHex(12)}`;
   try {
     const tx = await initializeTransaction(env, { email, amountPesewas, reference, fundType, callbackUrl: `${url.origin}/pay/return` });
@@ -272,7 +317,8 @@ async function initPayment(request, env, url) {
     return json({ success: true, authorizationUrl: tx.authorization_url, reference });
   } catch (e) {
     console.error('init payment failed', e.message);
-    return fail('Could not start the payment. Please try again.', 502);
+    // Paystack's own message (e.g. "Invalid key", "Currency not supported by merchant") is safe to show and makes problems fixable.
+    return fail(`Could not start the payment: ${String(e.message).slice(0, 160)}`, 502);
   }
 }
 
@@ -320,7 +366,10 @@ async function paymentStatus(env, reference) {
 function payReturn(url, env) {
   const ref = url.searchParams.get('reference') || url.searchParams.get('trxref') || '';
   if (!REF_RE.test(ref)) return new Response('Invalid reference', { status: 400 });
-  const deep = `${env.APP_SCHEME || 'calvarytemple'}://give/result?reference=${encodeURIComponent(ref)}`;
+  const scheme = env.APP_SCHEME || 'calvarytemple';
+  const pkg = env.APP_PACKAGE || 'com.prince.calvarytemple';
+  // An intent:// link is the form Chrome reliably hands to an installed app (a bare custom scheme is often blocked).
+  const deep = `intent://give/result?reference=${encodeURIComponent(ref)}#Intent;scheme=${scheme};package=${pkg};end`;
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Returning to the app</title><style>body{font-family:system-ui;text-align:center;padding:48px 24px}a{display:inline-block;margin-top:24px;padding:14px 28px;background:#1F3A68;color:#fff;border-radius:12px;text-decoration:none}</style></head>
 <body><h2>Thank you for giving</h2><p>Return to the Calvary Temple app to see your receipt status.</p>

@@ -127,7 +127,8 @@ const fresh = await (await post('/api/payments/init', { amountPesewas: 2550, ema
 assert.equal((await (await call(`/api/payments/${fresh.reference}`)).json()).status, 'success'); ok('status poll verifies with Paystack when webhook is late');
 assert.equal((await call('/pay/return?reference=../../x')).status, 400);
 const ret = await call(`/pay/return?reference=${fresh.reference}`);
-assert.ok((await ret.text()).includes('calvarytemple://give/result')); ok('return page deep-links back to app, rejects bad reference');
+const retHtml = await ret.text();
+assert.ok(retHtml.includes('scheme=calvarytemple') && retHtml.includes('give/result')); ok('return page deep-links back to app, rejects bad reference');
 
 // --- media ---
 const start = await (await post('/api/admin/media/multipart/start', { kind: 'sermon', contentType: 'audio/mpeg' }, auth)).json();

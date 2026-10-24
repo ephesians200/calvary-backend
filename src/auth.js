@@ -56,12 +56,26 @@ export async function verifyPassword(password, stored) {
   return safeEqual(toB64Url(bits), hash);
 }
 
-/** Returns { id, name, role } for a valid, still-active admin; otherwise null. */
+/** Every leader-portal button that can be switched on or off for an account. '*' means all of them. */
+export const PERMISSIONS = ['members', 'calendar', 'prayer', 'testimonies', 'pastor', 'announcements', 'upload', 'notice', 'users'];
+
+export function parsePermissions(raw) {
+  const text = String(raw ?? '*').trim();
+  if (text === '*' || text === '') return ['*'];
+  const list = text.split(',').map((x) => x.trim()).filter((x) => PERMISSIONS.includes(x));
+  return [...new Set(list)];
+}
+
+export const serializePermissions = (list) => (list.includes('*') ? '*' : list.join(','));
+export const can = (admin, perm) => !perm || admin.permissions.includes('*') || admin.permissions.includes(perm);
+
+/** Returns { id, name, role, permissions[] } for a valid, still-active admin; otherwise null. */
 export async function requireAdmin(request, env) {
   const header = request.headers.get('authorization') || '';
   if (!header.startsWith('Bearer ')) return null;
   const payload = await verifyJwt(header.slice(7), env.JWT_SECRET);
   if (!payload || payload.role !== 'admin') return null;
-  const row = await env.DB.prepare('SELECT id, name, role FROM admins WHERE id = ? AND active = 1').bind(payload.sub).first();
-  return row && row.role === 'admin' ? row : null;
+  const row = await env.DB.prepare('SELECT id, name, role, permissions FROM admins WHERE id = ? AND active = 1').bind(payload.sub).first();
+  if (!row || row.role !== 'admin') return null;
+  return { id: row.id, name: row.name, role: row.role, permissions: parsePermissions(row.permissions) };
 }

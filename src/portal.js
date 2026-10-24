@@ -1,5 +1,5 @@
 import { json, fail, readJson, clean, toHex } from './util.js';
-import { requireAdmin } from './auth.js';
+import { requireAdmin, can, verifyPassword, hashPassword } from './auth.js';
 import { sendTopicPush } from './fcm.js';
 
 const GROUPS = ['Men', 'Women', 'Youth'];
@@ -41,6 +41,8 @@ export async function portalRoute(request, env, ctx, url) {
   if (m('POST', '/api/testimonies')) return submitTestimony(request, env);
   if (m('GET', '/api/calendar')) return listCalendar(url, env);
   if (m('GET', '/api/pastor-words')) return listPastorWords(env);
+  if (m('GET', '/api/updates')) return updates(url, env);
+  if (m('POST', '/api/members/login')) return memberLogin(request, env);
 
   // ---------- leader (JWT) ----------
   const adminPath = pathname.startsWith('/api/admin/') &&
@@ -54,7 +56,10 @@ export async function portalRoute(request, env, ctx, url) {
   const id = parts[3] && parts[3] !== 'seen' ? idFrom(parts[3]) : null;
   const action = parts[3] === 'seen' ? 'seen' : parts[4];
 
-  if (resource === 'badges' && method === 'GET') return badges(env);
+  if (resource === 'badges' && method === 'GET') return badges(env, admin);
+
+  const needed = { members: 'members', 'prayer-requests': 'prayer', testimonies: 'testimonies', calendar: 'calendar', 'pastor-words': 'pastor' }[resource];
+  if (!can(admin, needed)) return fail('You do not have access to this', 403);
 
   if (resource === 'members') {
     if (method === 'GET' && !id) return adminListMembers(env);
@@ -317,12 +322,71 @@ async function removeRow(env, table, id) {
   return json({ success: true });
 }
 
-async function badges(env) {
-  const q = (sql) => env.DB.prepare(sql).first();
+async function badges(env, admin) {
+  const q = (perm, sql) => (can(admin, perm) ? env.DB.prepare(sql).first() : Promise.resolve({ n: 0 }));
   const [a, b, c] = await Promise.all([
-    q('SELECT COUNT(*) AS n FROM members WHERE seen = 0'),
-    q('SELECT COUNT(*) AS n FROM prayer_requests WHERE seen = 0'),
-    q("SELECT COUNT(*) AS n FROM testimonies WHERE status = 'pending'"),
+    q('members', 'SELECT COUNT(*) AS n FROM members WHERE seen = 0'),
+    q('prayer', 'SELECT COUNT(*) AS n FROM prayer_requests WHERE seen = 0'),
+    q('testimonies', "SELECT COUNT(*) AS n FROM testimonies WHERE status = 'pending'"),
   ]);
   return json({ success: true, members: a.n, prayer: b.n, testimonies: c.n });
+}
+
+// ================= member "unseen" badges =================
+const UPDATE_SOURCES = {
+  announcements: ['announcements', 'created_at', 'deleted = 0'],
+  pastor: ['pastor_words', 'created_at', 'deleted = 0'],
+  media: ['media', 'created_at', '1 = 1'],
+  testimonies: ['testimonies', 'approved_at', "status = 'approved'"],
+  calendar: ['calendar_events', 'updated_at', 'deleted = 0'],
+};
+
+/** For each category: `latest` (newest timestamp) and `count` of items newer than the `since` the app last saw. */
+async function updates(url, env) {
+  const out = {};
+  await Promise.all(Object.entries(UPDATE_SOURCES).map(async ([name, [table, col, where]]) => {
+    const latestRow = await env.DB.prepare(`SELECT COALESCE(MAX(${col}), 0) AS m FROM ${table} WHERE ${where}`).first();
+    const raw = url.searchParams.get(name);
+    const since = raw !== null && /^\d{1,15}$/.test(raw) ? Number(raw) : null;
+    let count = 0;
+    if (since !== null && latestRow.m > since) {
+      count = (await env.DB.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where} AND ${col} > ?`).bind(since).first()).n;
+    }
+    out[name] = { count: Math.min(count, 99), latest: latestRow.m };
+  }));
+  return json({ success: true, ...out }, 200, { 'cache-control': 'no-store' });
+}
+
+// ================= member sign-in (accounts created by a leader) =================
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const MAX_LOGIN_FAILURES = 5;
+
+async function memberLogin(request, env) {
+  const dev = deviceId(request);
+  if (!dev) return fail('Missing device id');
+  const b = await readJson(request);
+  const username = clean(b?.username, 64).toLowerCase();
+  const password = typeof b?.password === 'string' ? b.password.slice(0, 200) : '';
+  if (!username || !password) return fail('Username and password are required');
+
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const key = `m|${ip}|${username}`;
+  const now = Date.now();
+  const { c } = await env.DB.prepare('SELECT COUNT(*) AS c FROM login_attempts WHERE key = ? AND attempted_at > ?').bind(key, now - LOGIN_WINDOW_MS).first();
+  if (c >= MAX_LOGIN_FAILURES) return fail('Too many attempts. Try again in 15 minutes.', 429);
+
+  const row = await env.DB.prepare('SELECT id, password_hash FROM members WHERE username = ?').bind(username).first();
+  const ok = row?.password_hash
+    ? await verifyPassword(password, row.password_hash)
+    : (await verifyPassword(password, await hashPassword('dummy-password')), false);
+  if (!ok) {
+    await env.DB.prepare('INSERT INTO login_attempts (key, attempted_at) VALUES (?, ?)').bind(key, now).run();
+    return fail('Invalid username or password', 401);
+  }
+  await env.DB.prepare('DELETE FROM login_attempts WHERE key = ?').bind(key).run();
+
+  // This phone now belongs to the account. Drop a separate self-registered row for the same phone, if any.
+  await env.DB.prepare('DELETE FROM members WHERE device_id = ? AND id != ?').bind(dev, row.id).run();
+  await env.DB.prepare('UPDATE members SET device_id = ?, updated_at = ? WHERE id = ?').bind(dev, now, row.id).run();
+  return getProfile(request, env);
 }
