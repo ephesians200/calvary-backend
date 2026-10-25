@@ -1,7 +1,7 @@
 import { json, fail, readJson, clean, randomHex } from './util.js';
 import { hashPassword, verifyPassword, signJwt, requireAdmin, can, parsePermissions } from './auth.js';
 import { initializeTransaction, verifyTransaction, verifyWebhookSignature } from './paystack.js';
-import { sendTopicPush } from './fcm.js';
+import { sendTopicPush, subscribeToTopic } from './fcm.js';
 import { portalRoute } from './portal.js';
 import { usersRoute } from './users.js';
 import { watchPage, parseVideoLink } from './watch.js';
@@ -22,14 +22,41 @@ const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
 const MAX_LOGIN_FAILURES = 5;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
+// The web app (PWA) lives on Cloudflare Pages, a different origin from this Worker, so the browser needs CORS headers.
+// Default: https://calvarytemple.pages.dev and its preview URLs. Add more with a WEB_ORIGINS variable (comma separated).
+function allowedOrigin(origin, env) {
+  if (!origin) return null;
+  if (/^https:\/\/([a-z0-9-]+\.)?calvarytemple\.pages\.dev$/.test(origin)) return origin;
+  const extra = String(env.WEB_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  return extra.includes(origin) ? origin : null;
+}
+
+const CORS_HEADERS = {
+  'access-control-allow-methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'access-control-allow-headers': 'authorization, content-type, x-device-id',
+  'access-control-expose-headers': 'etag, content-range, content-length',
+  'access-control-max-age': '86400',
+  vary: 'Origin',
+};
+
 export default {
   async fetch(request, env, ctx) {
+    const origin = allowedOrigin(request.headers.get('origin'), env);
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: origin ? { ...CORS_HEADERS, 'access-control-allow-origin': origin } : {} });
+    }
+    let res;
     try {
-      return await route(request, env, ctx);
+      res = await route(request, env, ctx);
     } catch (err) {
       console.error('Unhandled error', err);
-      return fail('Server error', 500);
+      res = fail('Server error', 500);
     }
+    if (!origin) return res;
+    res = new Response(res.body, res); // copy so the headers can be changed
+    res.headers.set('access-control-allow-origin', origin);
+    for (const [k, v] of Object.entries(CORS_HEADERS)) res.headers.set(k, v);
+    return res;
   },
 };
 
@@ -44,7 +71,8 @@ async function route(request, env, ctx) {
   // ---- public ----
   if (m('GET', '/api/announcements')) return listAnnouncements(request, env);
   if (m('GET', '/api/media')) return listMedia(url, env);
-  if (method === 'GET' && pathname.startsWith('/media/')) return serveMedia(request, env, pathname.slice(7));
+  if (method === 'GET' && pathname.startsWith('/media/')) return serveMedia(request, env, pathname.slice(7), url);
+  if (m('POST', '/api/push/web')) return subscribeWebPush(request, env);
   if (method === 'GET' && pathname.startsWith('/watch/')) return watchLink(env, pathname.slice(7), url.origin);
   if (m('POST', '/api/auth/login')) return login(request, env);
   if (m('POST', '/api/payments/init')) return initPayment(request, env, url);
@@ -231,7 +259,7 @@ async function addLink(request, env, ctx, admin) {
   return json({ success: true, message: 'Link added' }, 201);
 }
 
-async function serveMedia(request, env, key) {
+async function serveMedia(request, env, key, url) {
   if (!KEY_RE.test(key)) return fail('Not found', 404);
   const rangeHeader = request.headers.get('range');
   const obj = await env.MEDIA.get(key, rangeHeader ? { range: request.headers } : undefined);
@@ -241,6 +269,12 @@ async function serveMedia(request, env, key) {
   obj.writeHttpMetadata(headers);
   headers.set('etag', obj.httpEtag);
   headers.set('accept-ranges', 'bytes');
+  if (url?.searchParams.has('download')) {
+    // ?download=1&name=My%20Sermon saves the file instead of playing it (used by the web app's Download button).
+    const ext = key.split('.').pop();
+    const base = (url.searchParams.get('name') || 'calvary-temple').replace(/[^A-Za-z0-9 _-]/g, '').trim().slice(0, 80) || 'calvary-temple';
+    headers.set('content-disposition', `attachment; filename="${base.replace(/ /g, '_')}.${ext}"`);
+  }
   headers.set('cache-control', 'public, max-age=31536000, immutable'); // keys are unique per upload
 
   if (rangeHeader && obj.range) {
@@ -310,6 +344,20 @@ async function uploadAbort(request, env) {
   return json({ success: true });
 }
 
+// ================= web push (the PWA registers its Firebase token here) =================
+async function subscribeWebPush(request, env) {
+  const body = await readJson(request);
+  const token = typeof body?.token === 'string' ? body.token : '';
+  if (!/^[A-Za-z0-9_:-]{100,4096}$/.test(token)) return fail('Bad token');
+  try {
+    await subscribeToTopic(env, token);
+    return json({ success: true });
+  } catch (e) {
+    console.error('web push subscribe failed', e.message);
+    return fail('Could not turn on notifications on the server', 502);
+  }
+}
+
 // ================= payments (Paystack, server-side) =================
 async function initPayment(request, env, url) {
   const body = await readJson(request);
@@ -324,7 +372,7 @@ async function initPayment(request, env, url) {
   if (!String(env.PAYSTACK_SECRET_KEY || '').trim()) return fail('Payments are not set up on the server yet (missing PAYSTACK_SECRET_KEY).', 503);
   const reference = `CT-${randomHex(12)}`;
   try {
-    const tx = await initializeTransaction(env, { email, amountPesewas, reference, fundType, callbackUrl: `${url.origin}/pay/return` });
+    const tx = await initializeTransaction(env, { email, amountPesewas, reference, fundType, callbackUrl: body?.web === true ? `${String(env.WEB_ORIGIN || 'https://calvarytemple.pages.dev').replace(/\/$/, '')}/` : `${url.origin}/pay/return` });
     await env.DB.prepare('INSERT INTO payments (reference, email, amount_pesewas, fund_type, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(reference, email, amountPesewas, fundType, Date.now()).run();
     return json({ success: true, authorizationUrl: tx.authorization_url, reference });

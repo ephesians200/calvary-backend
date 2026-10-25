@@ -18,7 +18,7 @@ async function accessToken(sa) {
     toB64Url(enc.encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))) + '.' +
     toB64Url(enc.encode(JSON.stringify({
       iss: sa.client_email,
-      scope: 'https://www.googleapis.com/auth/firebase.messaging',
+      scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/cloud-platform',
       aud: 'https://oauth2.googleapis.com/token',
       iat: now,
       exp: now + 3600,
@@ -53,9 +53,24 @@ export async function sendTopicPush(env, { title, body, type = 'announcement', t
         topic,
         data: { type, title: title.slice(0, 100), body: body.slice(0, 300) },
         android: { priority: 'HIGH' },
+        webpush: { headers: { Urgency: 'high', TTL: '86400' } },
       },
     }),
   });
   if (!res.ok) throw new Error(`FCM send failed: ${res.status} ${await res.text()}`);
   return { sent: true };
+}
+
+/** Adds a browser (PWA) registration token to a topic so it receives the same pushes as the Android app. */
+export async function subscribeToTopic(env, registrationToken, topic = 'announcements') {
+  if (!env.FCM_SERVICE_ACCOUNT_JSON) throw new Error('FCM_SERVICE_ACCOUNT_JSON is not set');
+  const sa = JSON.parse(env.FCM_SERVICE_ACCOUNT_JSON);
+  const token = await accessToken(sa);
+  const res = await fetch('https://iid.googleapis.com/iid/v1:batchAdd', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', access_token_auth: 'true' },
+    body: JSON.stringify({ to: `/topics/${topic}`, registration_tokens: [registrationToken] }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.results?.[0]?.error) throw new Error(`topic subscribe failed: ${res.status} ${JSON.stringify(data).slice(0, 200)}`);
 }
