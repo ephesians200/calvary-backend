@@ -1,6 +1,7 @@
 import { json, fail, readJson, clean, toHex } from './util.js';
 import { requireAdmin, can, verifyPassword, hashPassword } from './auth.js';
 import { sendTopicPush } from './fcm.js';
+import { sendToTokens } from './direct.js';
 
 const GROUPS = ['Men', 'Women', 'Youth'];
 const DEVICE_RE = /^[A-Za-z0-9-]{16,64}$/;
@@ -43,10 +44,13 @@ export async function portalRoute(request, env, ctx, url) {
   if (m('GET', '/api/pastor-words')) return listPastorWords(env);
   if (m('GET', '/api/updates')) return updates(url, env);
   if (m('POST', '/api/members/login')) return memberLogin(request, env);
+  if (m('PUT', '/api/members/push-token')) return savePushToken(request, env);
+  if (m('GET', '/api/members/messages')) return myMessages(request, env);
+  if (m('POST', '/api/members/messages/close')) return closeMessage(request, env);
 
   // ---------- leader (JWT) ----------
   const adminPath = pathname.startsWith('/api/admin/') &&
-    (/^\/api\/admin\/(members|prayer-requests|testimonies|calendar|pastor-words|badges)/.test(pathname));
+    (/^\/api\/admin\/(members|messages|prayer-requests|testimonies|calendar|pastor-words|badges)/.test(pathname));
   if (!adminPath) return null;
 
   const admin = await requireAdmin(request, env);
@@ -58,17 +62,21 @@ export async function portalRoute(request, env, ctx, url) {
 
   if (resource === 'badges' && method === 'GET') return badges(env, admin);
 
-  const needed = { members: 'members', 'prayer-requests': 'prayer', testimonies: 'testimonies', calendar: 'calendar', 'pastor-words': 'pastor' }[resource];
+  const needed = { members: 'members', messages: 'members', 'prayer-requests': 'prayer', testimonies: 'testimonies', calendar: 'calendar', 'pastor-words': 'pastor' }[resource];
   if (!can(admin, needed)) return fail('You do not have access to this', 403);
 
   if (resource === 'members') {
     if (method === 'GET' && !id) return adminListMembers(env);
     if (method === 'GET' && id && action === 'photo') return adminMemberPhoto(env, id);
     if (method === 'POST' && parts[3] === 'seen') return markSeen(env, 'members');
+    if (method === 'GET' && id && action === 'messages') return adminMemberMessages(env, id);
   }
+  if (resource === 'messages' && method === 'POST' && !id) return sendMessages(request, env, ctx, admin);
   if (resource === 'prayer-requests') {
     if (method === 'GET' && !id) return adminListPrayer(env);
     if (method === 'POST' && parts[3] === 'seen') return markSeen(env, 'prayer_requests');
+    if (method === 'POST' && parts[3] === 'delete') return deletePrayerMany(request, env);
+    if (method === 'POST' && id && action === 'read') return markPrayerRead(env, ctx, id);
     if (method === 'DELETE' && id) return removeRow(env, 'prayer_requests', id);
   }
   if (resource === 'testimonies') {
@@ -154,21 +162,54 @@ async function submitPrayer(request, env) {
   const dev = deviceId(request);
   if (!dev) return fail('Missing device id');
   const b = await readJson(request);
-  const name = clean(b?.name, 80);
+  const anonymous = b?.anonymous === true;
+  // An anonymous request never stores the name; the phone's device id is kept only so "read" can reach the member.
+  const name = anonymous ? 'Anonymous' : clean(b?.name, 80);
   const subject = clean(b?.subject, 120);
   const message = clean(b?.message, 2000);
   if (!name || !subject || !message) return fail('Name, subject and message are required');
   if (await overDailyLimit(env, 'prayer_requests', dev)) return fail('You have sent many requests today. Please try again tomorrow.', 429);
-  await env.DB.prepare('INSERT INTO prayer_requests (device_id, member_name, subject, message, created_at) VALUES (?, ?, ?, ?, ?)')
-    .bind(dev, name, subject, message, Date.now()).run();
+  await env.DB.prepare('INSERT INTO prayer_requests (device_id, member_name, subject, message, created_at, anonymous) VALUES (?, ?, ?, ?, ?, ?)')
+    .bind(dev, name, subject, message, Date.now(), anonymous ? 1 : 0).run();
   return json({ success: true, message: 'Prayer request sent to the pastor' }, 201);
 }
 
 async function adminListPrayer(env) {
+  // Unread first, then newest. The app can re-sort however the pastor likes.
   const { results } = await env.DB.prepare(
-    'SELECT id, member_name AS memberName, subject, message, seen, created_at AS createdAt FROM prayer_requests ORDER BY created_at DESC LIMIT 300',
+    `SELECT id, member_name AS memberName, subject, message, seen, is_read AS isRead, read_at AS readAt, anonymous, created_at AS createdAt
+     FROM prayer_requests ORDER BY is_read ASC, created_at DESC, id DESC LIMIT 1000`,
   ).all();
-  return json({ success: true, items: results.map((r) => ({ ...r, seen: !!r.seen })) });
+  return json({ success: true, items: results.map((r) => ({ ...r, seen: !!r.seen, isRead: !!r.isRead, anonymous: !!r.anonymous })) });
+}
+
+async function markPrayerRead(env, ctx, id) {
+  const row = await env.DB.prepare('SELECT device_id, subject, is_read FROM prayer_requests WHERE id = ?').bind(id).first();
+  if (!row) return fail('Not found', 404);
+  if (!row.is_read) {
+    await env.DB.prepare('UPDATE prayer_requests SET is_read = 1, read_at = ?, seen = 1 WHERE id = ?').bind(Date.now(), id).run();
+    // Tell that member (works for anonymous requests too: the pastor still cannot see who it was).
+    ctx.waitUntil((async () => {
+      const t = await env.DB.prepare('SELECT device_id, token FROM device_tokens WHERE device_id = ?').bind(row.device_id).first();
+      if (t) await sendToTokens(env, [t], { type: 'prayer_read', title: 'Your prayer request was read', body: `The pastor has read your prayer request: ${row.subject}` });
+    })().catch((e) => console.error('read push failed', e.message)));
+  }
+  return json({ success: true });
+}
+
+const CHUNK = 90; // D1 allows about 100 bound values per statement
+
+async function deletePrayerMany(request, env) {
+  const b = await readJson(request, 50_000);
+  const ids = Array.isArray(b?.ids) ? [...new Set(b.ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))].slice(0, 1000) : [];
+  if (!ids.length) return fail('Nothing selected');
+  const stmts = [];
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    stmts.push(env.DB.prepare(`DELETE FROM prayer_requests WHERE id IN (${part.map(() => '?').join(',')})`).bind(...part));
+  }
+  await env.DB.batch(stmts);
+  return json({ success: true, deleted: ids.length });
 }
 
 // ================= testimonies =================
@@ -291,6 +332,81 @@ async function updatePastorWord(request, env, id) {
 
 async function deletePastorWord(env, id) {
   await env.DB.prepare('UPDATE pastor_words SET deleted = 1, updated_at = ? WHERE id = ?').bind(Date.now(), id).run();
+  return json({ success: true });
+}
+
+// ================= private messages (pastor -> member) =================
+const MAX_PUSHES_PER_SEND = 40; // keeps one request inside the free plan's subrequest limit
+
+async function savePushToken(request, env) {
+  const dev = deviceId(request);
+  if (!dev) return fail('Missing device id');
+  const b = await readJson(request);
+  const token = clean(b?.token, 4096);
+  const platform = b?.platform === 'web' ? 'web' : 'android';
+  if (token.length < 20) return fail('Invalid token');
+  await env.DB.prepare(
+    `INSERT INTO device_tokens (device_id, token, platform, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(device_id) DO UPDATE SET token = excluded.token, platform = excluded.platform, updated_at = excluded.updated_at`,
+  ).bind(dev, token, platform, Date.now()).run();
+  return json({ success: true });
+}
+
+async function sendMessages(request, env, ctx, admin) {
+  const b = await readJson(request, 50_000);
+  const body = clean(b?.body, 1000);
+  const ids = Array.isArray(b?.memberIds) ? [...new Set(b.memberIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))].slice(0, 1000) : [];
+  if (!body) return fail('Write a message first');
+  if (!ids.length) return fail('Choose at least one member');
+  const now = Date.now();
+
+  const stmts = [];
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    stmts.push(env.DB.prepare(
+      `INSERT INTO member_messages (member_id, body, sent_by, created_at) SELECT id, ?, ?, ? FROM members WHERE id IN (${part.map(() => '?').join(',')})`,
+    ).bind(body, admin.name, now, ...part));
+  }
+  await env.DB.batch(stmts);
+
+  // Phone notification (best effort). Members without a push token still get the popup next time they open the app.
+  const first = ids.slice(0, MAX_PUSHES_PER_SEND);
+  const { results } = await env.DB.prepare(
+    `SELECT t.device_id, t.token FROM members m JOIN device_tokens t ON t.device_id = m.device_id WHERE m.id IN (${first.map(() => '?').join(',')})`,
+  ).bind(...first).all();
+  ctx.waitUntil(sendToTokens(env, results, { type: 'message', title: `Message from ${admin.name}`, body })
+    .catch((e) => console.error('message push failed', e.message)));
+  return json({ success: true, recipients: ids.length, notified: Math.min(results.length, MAX_PUSHES_PER_SEND), pushLimited: ids.length > MAX_PUSHES_PER_SEND });
+}
+
+async function adminMemberMessages(env, id) {
+  const { results } = await env.DB.prepare(
+    'SELECT id, body, sent_by AS sentBy, created_at AS createdAt, closed_at AS closedAt FROM member_messages WHERE member_id = ? ORDER BY created_at DESC LIMIT 20',
+  ).bind(id).all();
+  return json({ success: true, items: results.map((r) => ({ ...r, closed: r.closedAt != null })) });
+}
+
+/** Messages this member has not closed yet (the app shows them as a popup when it opens). */
+async function myMessages(request, env) {
+  const dev = deviceId(request);
+  if (!dev) return fail('Missing device id');
+  const { results } = await env.DB.prepare(
+    `SELECT g.id, g.body, g.sent_by AS sentBy, g.created_at AS createdAt
+     FROM member_messages g JOIN members m ON m.id = g.member_id
+     WHERE m.device_id = ? AND g.closed_at IS NULL ORDER BY g.created_at ASC LIMIT 10`,
+  ).bind(dev).all();
+  return json({ success: true, items: results });
+}
+
+async function closeMessage(request, env) {
+  const dev = deviceId(request);
+  if (!dev) return fail('Missing device id');
+  const b = await readJson(request);
+  const id = idFrom(b?.id);
+  if (!id) return fail('Missing message');
+  await env.DB.prepare(
+    'UPDATE member_messages SET closed_at = ? WHERE id = ? AND closed_at IS NULL AND member_id IN (SELECT id FROM members WHERE device_id = ?)',
+  ).bind(Date.now(), id, dev).run();
   return json({ success: true });
 }
 
