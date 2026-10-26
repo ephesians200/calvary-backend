@@ -81,7 +81,10 @@ CREATE TABLE IF NOT EXISTS prayer_requests (
   subject TEXT NOT NULL,
   message TEXT NOT NULL,
   seen INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  is_read INTEGER NOT NULL DEFAULT 0,
+  read_at INTEGER,
+  anonymous INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_prayer_created ON prayer_requests(created_at DESC);
 
@@ -124,3 +127,20 @@ CREATE INDEX IF NOT EXISTS idx_pastor_created ON pastor_words(deleted, created_a
 CREATE UNIQUE INDEX IF NOT EXISTS idx_members_username ON members(username) WHERE username IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_testimonies_approved ON testimonies(status, approved_at);
 CREATE INDEX IF NOT EXISTS idx_calendar_updated ON calendar_events(deleted, updated_at);
+
+-- ===== v4: private messages, read prayers, push tokens =====
+CREATE TABLE IF NOT EXISTS device_tokens (
+  device_id TEXT PRIMARY KEY,
+  token TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'android',
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS member_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  member_id INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  sent_by TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  closed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_messages_member ON member_messages(member_id, closed_at, created_at DESC);
