@@ -1,0 +1,75 @@
+name: 1. Create a church
+# Click "Run workflow", fill in the form. About 2 minutes later the church has its own database, file storage,
+# Worker, secrets and pastor login. The result (server address + pastor password) appears in the run's Summary.
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'Short id: lowercase letters/digits, e.g. jireh (same as the Android folder name src/<id>/)'
+        required: true
+      display_name:
+        description: 'Church name, e.g. Jireh Temple'
+        required: true
+      app_id:
+        description: 'Android app id, e.g. com.churchdome.royalhousejireh (same as appId in church.json)'
+        required: true
+      groups:
+        description: 'Fellowship group ids, comma separated, letters only (same as groups in church.json)'
+        required: true
+        default: 'Men,Women,Youth'
+      app_scheme:
+        description: 'App link scheme (same as deepLinkScheme in church.json). Leave empty to use the id'
+        required: false
+      pastor_name:
+        description: "Pastor's name"
+        required: true
+        default: 'Pastor'
+      pastor_username:
+        description: "Pastor's username"
+        required: true
+        default: 'pastor'
+      web_origin:
+        description: 'Web app address, e.g. https://jireh.pages.dev (optional, can be added later)'
+        required: false
+
+concurrency: churchdome-ops
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Create the church
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional: add GitHub secrets named FCM_<id> and PAYSTACK_<id> (e.g. FCM_JIREH) BEFORE running, or add them later.
+          FCM_SERVICE_ACCOUNT_JSON: ${{ secrets[format('FCM_{0}', inputs.slug)] }}
+          PAYSTACK_SECRET_KEY: ${{ secrets[format('PAYSTACK_{0}', inputs.slug)] }}
+          IN_SLUG: ${{ inputs.slug }}
+          IN_NAME: ${{ inputs.display_name }}
+          IN_APP_ID: ${{ inputs.app_id }}
+          IN_GROUPS: ${{ inputs.groups }}
+          IN_SCHEME: ${{ inputs.app_scheme }}
+          IN_PASTOR_NAME: ${{ inputs.pastor_name }}
+          IN_PASTOR_USER: ${{ inputs.pastor_username }}
+          IN_WEB: ${{ inputs.web_origin }}
+        run: |
+          node scripts/create-church.mjs --slug "$IN_SLUG" --name "$IN_NAME" --app-id "$IN_APP_ID" --groups "$IN_GROUPS" \
+            --scheme "${IN_SCHEME:-$IN_SLUG}" --pastor-name "$IN_PASTOR_NAME" --pastor-username "$IN_PASTOR_USER" --web-origin "$IN_WEB"
+      - name: Save the church's record (tenants/<id>.json)
+        if: always()
+        run: |
+          git config user.name "churchdome-bot"
+          git config user.email "churchdome-bot@users.noreply.github.com"
+          git add tenants/*.json
+          if git diff --cached --quiet; then echo "nothing to save"; else
+            git commit -m "tenants: ${{ inputs.slug }} [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi

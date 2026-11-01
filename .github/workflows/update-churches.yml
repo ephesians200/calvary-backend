@@ -1,0 +1,39 @@
+name: 2. Update all churches
+# Runs by itself when you change the backend code (src/, schema.sql, migrations/) or a church's settings (tenants/).
+# Applies new database migrations, then redeploys every church. One failing church does not stop the others.
+# Calvary Temple is skipped here: Cloudflare's own GitHub connection already redeploys it on every push.
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'schema.sql', 'migrations/**', 'tenants/**', 'scripts/**']
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'Only this church (leave empty for all)'
+        required: false
+
+concurrency: churchdome-ops
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test first (stops here if the code is broken)
+        run: |
+          for t in selftest selftest_v3 selftest_portal selftest_cors selftest_v7 selftest_tenancy; do
+            node --no-warnings scripts/$t.mjs > /tmp/$t.log 2>&1 || { tail -30 /tmp/$t.log; echo "::error::$t failed - nothing was deployed"; exit 1; }
+          done
+          echo "All self-tests passed."
+      - name: Update churches
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          IN_SLUG: ${{ inputs.slug }}
+        run: node scripts/update-churches.mjs $IN_SLUG
