@@ -1,9 +1,9 @@
-import { json, fail, readJson, clean, toHex } from './util.js';
+import { json, fail, readJson, clean, toHex, USERNAME_RE, MIN_PASSWORD, randomPassword, phoneKey, groupsOf } from './util.js';
 import { requireAdmin, can, verifyPassword, hashPassword } from './auth.js';
 import { sendTopicPush } from './fcm.js';
 import { sendToTokens } from './direct.js';
+import { usernameTaken } from './users.js';
 
-const GROUPS = ['Men', 'Women', 'Youth'];
 const DEVICE_RE = /^[A-Za-z0-9-]{16,64}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_PHOTO_BYTES = 1_500_000;
@@ -69,7 +69,9 @@ export async function portalRoute(request, env, ctx, url) {
     if (method === 'GET' && !id) return adminListMembers(env);
     if (method === 'GET' && id && action === 'photo') return adminMemberPhoto(env, id);
     if (method === 'POST' && parts[3] === 'seen') return markSeen(env, 'members');
+    if (method === 'POST' && parts[3] === 'merge') return mergeMembers(request, env);
     if (method === 'GET' && id && action === 'messages') return adminMemberMessages(env, id);
+    if (method === 'PUT' && id && action === 'account') return setMemberAccount(request, env, id);
   }
   if (resource === 'messages' && method === 'POST' && !id) return sendMessages(request, env, ctx, admin);
   if (resource === 'prayer-requests') {
@@ -105,7 +107,7 @@ async function saveProfile(request, env) {
   const b = await readJson(request);
   const name = clean(b?.name, 80);
   const phone = clean(b?.phone, 25);
-  const group = GROUPS.includes(b?.group) ? b.group : null;
+  const group = groupsOf(env).includes(b?.group) ? b.group : null;
   if (!name || !phone || !group) return fail('Name, phone number and group are required');
   const dob = clean(b?.dob, 20);
   const location = clean(b?.location, 120);
@@ -113,14 +115,28 @@ async function saveProfile(request, env) {
   const house = clean(b?.houseNumber, 40);
   const now = Date.now();
 
-  // One row per phone: editing updates it and flags it as "new" again, so leaders never see duplicates.
+  // Optional sign-in, so the member can get back in after changing phones.
+  const username = clean(b?.username, 32).toLowerCase();
+  const password = typeof b?.password === 'string' ? b.password.slice(0, 100) : '';
+  let hash = null;
+  if (username || password) {
+    if (!USERNAME_RE.test(username)) return fail('Username must be 3-32 letters, numbers, dots, dashes or underscores');
+    if (password.length < MIN_PASSWORD) return fail(`Password must be at least ${MIN_PASSWORD} characters`);
+    const mine = await env.DB.prepare('SELECT username FROM members WHERE device_id = ?').bind(dev).first();
+    if (!mine?.username) { // a member who already has a sign-in keeps it; only the office can reset it
+      if (await usernameTaken(env, username)) return fail('That username is already taken. Please choose another.', 409);
+      hash = await hashPassword(password);
+    }
+  }
+
   await env.DB.prepare(
-    `INSERT INTO members (device_id, name, dob, location, hometown, house_number, phone, group_name, seen, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `INSERT INTO members (device_id, name, dob, location, hometown, house_number, phone, group_name, username, password_hash, seen, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
      ON CONFLICT(device_id) DO UPDATE SET name = excluded.name, dob = excluded.dob, location = excluded.location,
        hometown = excluded.hometown, house_number = excluded.house_number, phone = excluded.phone,
-       group_name = excluded.group_name, seen = 0, updated_at = excluded.updated_at`,
-  ).bind(dev, name, dob, location, hometown, house, phone, group, now, now).run();
+       group_name = excluded.group_name, username = COALESCE(members.username, excluded.username),
+       password_hash = COALESCE(members.password_hash, excluded.password_hash), seen = 0, updated_at = excluded.updated_at`,
+  ).bind(dev, name, dob, location, hometown, house, phone, group, hash ? username : null, hash, now, now).run();
   return json({ success: true, message: 'Profile saved' });
 }
 
@@ -128,7 +144,7 @@ async function getProfile(request, env) {
   const dev = deviceId(request);
   if (!dev) return fail('Missing device id');
   const row = await env.DB.prepare(
-    `SELECT name, dob, location, hometown, house_number AS houseNumber, phone, group_name AS "group", photo_key IS NOT NULL AS hasPhoto
+    `SELECT name, dob, location, hometown, house_number AS houseNumber, phone, group_name AS "group", photo_key IS NOT NULL AS hasPhoto, username
      FROM members WHERE device_id = ?`,
   ).bind(dev).first();
   return json({ success: true, profile: row ? { ...row, hasPhoto: !!row.hasPhoto } : null });
@@ -414,10 +430,96 @@ async function closeMessage(request, env) {
 async function adminListMembers(env) {
   const { results } = await env.DB.prepare(
     `SELECT id, name, dob, location, hometown, house_number AS houseNumber, phone, group_name AS "group",
-            photo_key IS NOT NULL AS hasPhoto, seen, created_at AS createdAt, updated_at AS updatedAt
+            photo_key IS NOT NULL AS hasPhoto, seen, username, created_at AS createdAt, updated_at AS updatedAt
      FROM members ORDER BY updated_at DESC LIMIT 5000`,
   ).all();
-  return json({ success: true, items: results.map((r) => ({ ...r, hasPhoto: !!r.hasPhoto, seen: !!r.seen })) });
+  // Flag people who appear more than once with the same phone number.
+  const byPhone = new Map();
+  for (const r of results) {
+    const k = phoneKey(r.phone);
+    if (k) byPhone.set(k, [...(byPhone.get(k) || []), r.id]);
+  }
+  return json({
+    success: true,
+    items: results.map((r) => {
+      const same = byPhone.get(phoneKey(r.phone)) || [];
+      return { ...r, hasPhoto: !!r.hasPhoto, seen: !!r.seen, hasAccount: !!r.username, username: r.username || '', duplicateIds: same.length > 1 ? same.filter((x) => x !== r.id) : [] };
+    }),
+  });
+}
+
+/**
+ * Sign-in details for one member. The password itself is never stored in a readable form, so it cannot be shown;
+ * instead the pastor can set a new one (or have one generated) and read it out to the member once.
+ * Body: { password? , username? }  - username only counts when the member has none yet.
+ */
+async function setMemberAccount(request, env, id) {
+  const b = await readJson(request);
+  const row = await env.DB.prepare('SELECT id, name, phone, username FROM members WHERE id = ?').bind(id).first();
+  if (!row) return fail('Not found', 404);
+
+  let username = row.username;
+  if (!username) {
+    username = clean(b?.username, 32).toLowerCase();
+    if (!username) { // make one up: first name + last 4 digits of the phone
+      const first = (row.name.toLowerCase().match(/[a-z0-9]+/) || ['member'])[0].slice(0, 14);
+      const tail = String(row.phone || '').replace(/\D/g, '').slice(-4) || String(id);
+      username = `${first}.${tail}`;
+      if (!USERNAME_RE.test(username) || await usernameTaken(env, username)) username = `${first}.${tail}${Math.floor(Math.random() * 90 + 10)}`;
+    }
+    if (!USERNAME_RE.test(username)) return fail('Username must be 3-32 letters, numbers, dots, dashes or underscores');
+    if (await usernameTaken(env, username)) return fail('That username is already taken', 409);
+  }
+
+  let password = typeof b?.password === 'string' ? b.password.slice(0, 100) : '';
+  if (password && password.length < MIN_PASSWORD) return fail(`Password must be at least ${MIN_PASSWORD} characters`);
+  const generated = !password;
+  if (generated) password = randomPassword(10);
+
+  await env.DB.prepare('UPDATE members SET username = ?, password_hash = ? WHERE id = ?').bind(username, await hashPassword(password), id).run();
+  // The new password is returned once, here. Only the hash is stored.
+  return json({ success: true, username, password, generated, message: 'Password changed' });
+}
+
+/**
+ * Merge a duplicate into the member to keep. Messages, prayer requests and testimonies move across, blanks in the kept
+ * profile are filled from the duplicate, and the sign-in and push address of the phone used most recently are kept.
+ * Body: { keepId, removeId }
+ */
+async function mergeMembers(request, env) {
+  const b = await readJson(request);
+  const keepId = idFrom(b?.keepId);
+  const removeId = idFrom(b?.removeId);
+  if (!keepId || !removeId || keepId === removeId) return fail('Choose two different members to merge');
+  const get = (id) => env.DB.prepare('SELECT * FROM members WHERE id = ?').bind(id).first();
+  const [keep, gone] = [await get(keepId), await get(removeId)];
+  if (!keep || !gone) return fail('Member not found', 404);
+
+  const newest = gone.updated_at > keep.updated_at ? gone : keep; // the phone in use now
+  const oldDev = newest === gone ? keep.device_id : gone.device_id;
+  const newDev = newest.device_id;
+  const username = keep.username || gone.username || null;
+  const passwordHash = keep.username ? keep.password_hash : (gone.username ? gone.password_hash : null);
+  const fill = (a, c) => (a && String(a).trim() ? a : c);
+
+  const stmts = [
+    env.DB.prepare('UPDATE member_messages SET member_id = ? WHERE member_id = ?').bind(keepId, removeId),
+    env.DB.prepare('DELETE FROM members WHERE id = ?').bind(removeId), // frees the username and device id
+    env.DB.prepare(
+      `UPDATE members SET device_id = ?, username = ?, password_hash = ?, dob = ?, location = ?, hometown = ?, house_number = ?,
+              photo_key = ?, seen = 0, updated_at = ? WHERE id = ?`,
+    ).bind(newDev, username, passwordHash, fill(keep.dob, gone.dob), fill(keep.location, gone.location), fill(keep.hometown, gone.hometown),
+      fill(keep.house_number, gone.house_number), keep.photo_key || gone.photo_key || null, Date.now(), keepId),
+  ];
+  if (oldDev !== newDev) {
+    stmts.push(
+      env.DB.prepare('UPDATE prayer_requests SET device_id = ? WHERE device_id = ?').bind(newDev, oldDev),
+      env.DB.prepare('UPDATE testimonies SET device_id = ? WHERE device_id = ?').bind(newDev, oldDev),
+      env.DB.prepare('DELETE FROM device_tokens WHERE device_id = ?').bind(oldDev),
+    );
+  }
+  await env.DB.batch(stmts);
+  return json({ success: true, message: 'Members merged' });
 }
 
 async function adminMemberPhoto(env, id) {
@@ -491,7 +593,7 @@ async function memberLogin(request, env) {
   const { c } = await env.DB.prepare('SELECT COUNT(*) AS c FROM login_attempts WHERE key = ? AND attempted_at > ?').bind(key, now - LOGIN_WINDOW_MS).first();
   if (c >= MAX_LOGIN_FAILURES) return fail('Too many attempts. Try again in 15 minutes.', 429);
 
-  const row = await env.DB.prepare('SELECT id, password_hash FROM members WHERE username = ?').bind(username).first();
+  const row = await env.DB.prepare('SELECT id, password_hash, device_id FROM members WHERE username = ?').bind(username).first();
   const ok = row?.password_hash
     ? await verifyPassword(password, row.password_hash)
     : (await verifyPassword(password, await hashPassword('dummy-password')), false);
@@ -501,8 +603,24 @@ async function memberLogin(request, env) {
   }
   await env.DB.prepare('DELETE FROM login_attempts WHERE key = ?').bind(key).run();
 
-  // This phone now belongs to the account. Drop a separate self-registered row for the same phone, if any.
-  await env.DB.prepare('DELETE FROM members WHERE device_id = ? AND id != ?').bind(dev, row.id).run();
-  await env.DB.prepare('UPDATE members SET device_id = ?, updated_at = ? WHERE id = ?').bind(dev, now, row.id).run();
+  // This phone now belongs to the account. A separate self-registered row on this phone is a duplicate: fold it in.
+  const mine = await env.DB.prepare('SELECT id FROM members WHERE device_id = ? AND id != ?').bind(dev, row.id).first();
+  const stmts = [];
+  if (mine) {
+    stmts.push(
+      env.DB.prepare('UPDATE member_messages SET member_id = ? WHERE member_id = ?').bind(row.id, mine.id),
+      env.DB.prepare('DELETE FROM members WHERE id = ?').bind(mine.id),
+    );
+  }
+  // The account's old phone: its prayer requests, testimonies and push address follow the member to this phone.
+  if (row.device_id && row.device_id !== dev) {
+    stmts.push(
+      env.DB.prepare('UPDATE prayer_requests SET device_id = ? WHERE device_id = ?').bind(dev, row.device_id),
+      env.DB.prepare('UPDATE testimonies SET device_id = ? WHERE device_id = ?').bind(dev, row.device_id),
+      env.DB.prepare('DELETE FROM device_tokens WHERE device_id = ?').bind(row.device_id),
+    );
+  }
+  stmts.push(env.DB.prepare('UPDATE members SET device_id = ?, updated_at = ? WHERE id = ?').bind(dev, now, row.id));
+  await env.DB.batch(stmts);
   return getProfile(request, env);
 }

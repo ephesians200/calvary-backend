@@ -1,4 +1,4 @@
-import { json, fail, readJson, clean, randomHex } from './util.js';
+import { json, fail, readJson, clean, randomHex, groupsOf } from './util.js';
 import { hashPassword, verifyPassword, signJwt, requireAdmin, can, parsePermissions } from './auth.js';
 import { initializeTransaction, verifyTransaction, verifyWebhookSignature } from './paystack.js';
 import { sendTopicPush, subscribeToTopic } from './fcm.js';
@@ -6,7 +6,8 @@ import { portalRoute } from './portal.js';
 import { usersRoute } from './users.js';
 import { watchPage, parseVideoLink } from './watch.js';
 
-const CATEGORIES = ['General', 'Service', 'Event', 'Prayer', 'Youth', 'Women', 'Men', 'Children'];
+const BASE_CATEGORIES = ['General', 'Service', 'Event', 'Prayer', 'Children'];
+const categoriesOf = (env) => [...new Set([...BASE_CATEGORIES, ...groupsOf(env)])];
 const FUNDS = ['Offering', 'Tithe', 'Missions', 'Building'];
 const EXT = {
   'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/mp4a-latm': 'm4a', 'audio/aac': 'aac',
@@ -23,12 +24,13 @@ const MAX_LOGIN_FAILURES = 5;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
 // The web app (PWA) lives on Cloudflare Pages, a different origin from this Worker, so the browser needs CORS headers.
-// Default: https://calvarytemple.pages.dev and its preview URLs. Add more with a WEB_ORIGINS variable (comma separated).
+// Each church sets its own web address with WEB_ORIGIN (and optionally more in WEB_ORIGINS, comma separated).
+// Only the original Calvary Temple deployment (no CHURCH_NAME variable) also gets its old built-in address, so no church can be reached from another's site.
 function allowedOrigin(origin, env) {
   if (!origin) return null;
-  if (/^https:\/\/([a-z0-9-]+\.)?calvarytemple\.pages\.dev$/.test(origin)) return origin;
-  const extra = String(env.WEB_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean);
-  return extra.includes(origin) ? origin : null;
+  if (!env.CHURCH_NAME && /^https:\/\/([a-z0-9-]+\.)?calvarytemple\.pages\.dev$/.test(origin)) return origin;
+  const own = [env.WEB_ORIGIN, ...String(env.WEB_ORIGINS || '').split(',')].map((x) => String(x || '').trim().replace(/\/$/, '')).filter(Boolean);
+  return own.includes(origin) ? origin : null;
 }
 
 const CORS_HEADERS = {
@@ -163,7 +165,7 @@ async function createAnnouncement(request, env, ctx, admin) {
   const body = await readJson(request);
   const title = clean(body?.title, 120);
   const text = clean(body?.body, 2000);
-  const category = CATEGORIES.includes(body?.category) ? body.category : 'General';
+  const category = categoriesOf(env).includes(body?.category) ? body.category : 'General';
   if (!title || !text) return fail('Title and message are required');
 
   const now = Date.now();
@@ -182,7 +184,7 @@ async function updateAnnouncement(request, env, idStr) {
   const body = await readJson(request);
   const title = clean(body?.title, 120);
   const text = clean(body?.body, 2000);
-  const category = CATEGORIES.includes(body?.category) ? body.category : 'General';
+  const category = categoriesOf(env).includes(body?.category) ? body.category : 'General';
   if (!title || !text) return fail('Title and message are required');
   const res = await env.DB.prepare('UPDATE announcements SET title = ?, body = ?, category = ?, updated_at = ? WHERE id = ? AND deleted = 0')
     .bind(title, text, category, Date.now(), id).run();
@@ -272,7 +274,7 @@ async function serveMedia(request, env, key, url) {
   if (url?.searchParams.has('download')) {
     // ?download=1&name=My%20Sermon saves the file instead of playing it (used by the web app's Download button).
     const ext = key.split('.').pop();
-    const base = (url.searchParams.get('name') || 'calvary-temple').replace(/[^A-Za-z0-9 _-]/g, '').trim().slice(0, 80) || 'calvary-temple';
+    const base = (url.searchParams.get('name') || 'sermon').replace(/[^A-Za-z0-9 _-]/g, '').trim().slice(0, 80) || 'sermon';
     headers.set('content-disposition', `attachment; filename="${base.replace(/ /g, '_')}.${ext}"`);
   }
   headers.set('cache-control', 'public, max-age=31536000, immutable'); // keys are unique per upload
@@ -372,7 +374,7 @@ async function initPayment(request, env, url) {
   if (!String(env.PAYSTACK_SECRET_KEY || '').trim()) return fail('Payments are not set up on the server yet (missing PAYSTACK_SECRET_KEY).', 503);
   const reference = `CT-${randomHex(12)}`;
   try {
-    const tx = await initializeTransaction(env, { email, amountPesewas, reference, fundType, callbackUrl: body?.web === true ? `${String(env.WEB_ORIGIN || 'https://calvarytemple.pages.dev').replace(/\/$/, '')}/` : `${url.origin}/pay/return` });
+    const tx = await initializeTransaction(env, { email, amountPesewas, reference, fundType, callbackUrl: body?.web === true ? `${String(env.WEB_ORIGIN || (env.CHURCH_NAME ? url.origin : 'https://calvarytemple.pages.dev')).replace(/\/$/, '')}/` : `${url.origin}/pay/return` });
     await env.DB.prepare('INSERT INTO payments (reference, email, amount_pesewas, fund_type, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(reference, email, amountPesewas, fundType, Date.now()).run();
     return json({ success: true, authorizationUrl: tx.authorization_url, reference });
@@ -429,11 +431,12 @@ function payReturn(url, env) {
   if (!REF_RE.test(ref)) return new Response('Invalid reference', { status: 400 });
   const scheme = env.APP_SCHEME || 'calvarytemple';
   const pkg = env.APP_PACKAGE || 'com.prince.calvarytemple';
+  const churchName = String(env.CHURCH_NAME || 'Calvary Temple').replace(/[<>&"']/g, '');
   // An intent:// link is the form Chrome reliably hands to an installed app (a bare custom scheme is often blocked).
   const deep = `intent://give/result?reference=${encodeURIComponent(ref)}#Intent;scheme=${scheme};package=${pkg};end`;
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Returning to the app</title><style>body{font-family:system-ui;text-align:center;padding:48px 24px}a{display:inline-block;margin-top:24px;padding:14px 28px;background:#1F3A68;color:#fff;border-radius:12px;text-decoration:none}</style></head>
-<body><h2>Thank you for giving</h2><p>Return to the Calvary Temple app to see your receipt status.</p>
+<body><h2>Thank you for giving</h2><p>Return to the ${churchName} app to see your receipt status.</p>
 <a href="${deep}">Return to the app</a><script>setTimeout(function(){location.href=${JSON.stringify(deep)}},300)</script></body></html>`;
   return new Response(html, {
     headers: { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'", 'cache-control': 'no-store' },

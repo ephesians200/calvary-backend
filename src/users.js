@@ -1,13 +1,12 @@
-import { json, fail, readJson, clean, randomHex } from './util.js';
+import { json, fail, readJson, clean, randomHex, groupsOf } from './util.js';
 import { hashPassword, PERMISSIONS, parsePermissions, serializePermissions, can } from './auth.js';
 
-const GROUPS = ['Men', 'Women', 'Youth'];
 const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
 const MIN_PASSWORD = 8;
 
 const cleanPassword = (v) => (typeof v === 'string' ? v.slice(0, 100) : '');
 
-async function usernameTaken(env, username) {
+export async function usernameTaken(env, username) {
   const a = await env.DB.prepare('SELECT 1 AS x FROM admins WHERE username = ?').bind(username).first();
   if (a) return true;
   const m = await env.DB.prepare('SELECT 1 AS x FROM members WHERE username = ?').bind(username).first();
@@ -76,7 +75,7 @@ async function createUser(request, env, admin) {
   }
 
   const phone = clean(b?.phone, 25);
-  const group = GROUPS.includes(b?.group) ? b.group : null;
+  const group = groupsOf(env).includes(b?.group) ? b.group : null;
   if (phone.replace(/\D/g, '').length < 7) return fail('A valid phone number is required');
   if (!group) return fail('Choose a fellowship group');
   const res = await env.DB.prepare(

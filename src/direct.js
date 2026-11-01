@@ -1,6 +1,7 @@
 // Sends a push to ONE phone (by its FCM token) instead of the whole "announcements" topic.
 // Kept separate from fcm.js so the topic sender you already deployed is not touched.
 import { toB64Url } from './util.js';
+import { androidNotification } from './fcm.js';
 
 const enc = new TextEncoder();
 let cached = { token: null, exp: 0 };
@@ -54,7 +55,7 @@ export async function sendToTokens(env, targets, { type, title, body }) {
           message: {
             token: t.token,
             data: { type, title: title.slice(0, 100), body: body.slice(0, 300) },
-            android: { priority: 'HIGH' },
+            android: { priority: 'HIGH', notification: androidNotification(title, body) },
             webpush: { headers: { Urgency: 'high' } },
           },
         }),

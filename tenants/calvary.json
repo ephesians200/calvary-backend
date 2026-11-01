@@ -1,0 +1,12 @@
+{
+  "slug": "calvary",
+  "displayName": "Calvary Temple",
+  "status": "active",
+  "managedBy": "cloudflare-git",
+  "note": "The original deployment. It updates itself through Cloudflare's GitHub connection, so update-churches skips it. Backups still include it.",
+  "workerName": "calvary-backend",
+  "database": { "name": "calvary-db", "id": "" },
+  "bucket": "calvary-media",
+  "url": "https://calvary-backend.ephesians200.workers.dev",
+  "vars": {}
+}

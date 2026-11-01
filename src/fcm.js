@@ -1,6 +1,16 @@
 import { toB64Url } from './util.js';
 
 const enc = new TextEncoder();
+
+/**
+ * Android-only display block. With it, Google Play services shows the notification itself even when the app process
+ * cannot be started (phones that block background starts or have "battery saver" on). The app still receives the same
+ * data and shows its own notification when it is open. Web push ignores this block.
+ */
+export const androidNotification = (title, body) => ({
+  title: String(title).slice(0, 100), body: String(body).slice(0, 300),
+  channel_id: 'church_announcements_channel', notification_priority: 'PRIORITY_HIGH', default_sound: true,
+});
 let cached = { token: null, exp: 0 };
 
 function pemToDer(pem) {
@@ -52,7 +62,7 @@ export async function sendTopicPush(env, { title, body, type = 'announcement', t
       message: {
         topic,
         data: { type, title: title.slice(0, 100), body: body.slice(0, 300) },
-        android: { priority: 'HIGH' },
+        android: { priority: 'HIGH', notification: androidNotification(title, body) },
         webpush: { headers: { Urgency: 'high', TTL: '86400' } },
       },
     }),

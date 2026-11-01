@@ -55,3 +55,37 @@ export async function readJson(request, maxBytes = 20_000) {
 }
 
 export const clean = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+
+export const USERNAME_RE = /^[a-z0-9._-]{3,32}$/;
+export const MIN_PASSWORD = 8;
+
+/** Random password from characters that are hard to mix up when read aloud (no 0/O, 1/l/I). */
+const PW_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+export function randomPassword(length = 10) {
+  let out = '';
+  const limit = 256 - (256 % PW_ALPHABET.length); // reject values that would bias the pick
+  while (out.length < length) {
+    for (const b of crypto.getRandomValues(new Uint8Array(length * 2))) {
+      if (b < limit && out.length < length) out += PW_ALPHABET[b % PW_ALPHABET.length];
+    }
+  }
+  return out;
+}
+
+/**
+ * Same person, different way of typing the number (024 123 4567, 0241234567, +233 24 123 4567) -> same key.
+ * Uses the last 9 digits. Returns '' when there are too few digits to compare.
+ */
+export function phoneKey(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits.length < 7 ? '' : digits.slice(-9);
+}
+
+/**
+ * The church's fellowship groups. Set per church with the CHURCH_GROUPS variable (comma separated ids, e.g. "Men,Women,Youth,Children");
+ * the ids must match "groups" in the app's church.json. Defaults to the original three.
+ */
+export function groupsOf(env) {
+  const ids = String(env?.CHURCH_GROUPS || 'Men,Women,Youth').split(',').map((x) => x.trim()).filter((x) => /^[A-Za-z]{2,20}$/.test(x));
+  return ids.length ? ids : ['Men', 'Women', 'Youth'];
+}

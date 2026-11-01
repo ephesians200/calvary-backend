@@ -18,10 +18,12 @@ const D1 = {
       bind(...a) { args = a.map((x) => (x === undefined ? null : x)); return api; },
       async first() { return stmt.get(...args) ?? null; },
       async all() { return { results: stmt.all(...args) }; },
+      _run() { return stmt.run(...args); },
       async run() { const r = stmt.run(...args); return { meta: { last_row_id: Number(r.lastInsertRowid), changes: r.changes } }; },
     };
     return api;
   },
+  async batch(list) { db.exec('BEGIN'); try { for (const x of list) x._run(); db.exec('COMMIT'); } catch (e) { db.exec('ROLLBACK'); throw e; } return []; },
 };
 
 const store = new Map();
