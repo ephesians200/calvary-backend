@@ -1,0 +1,21 @@
+{
+  "slug": "jireh",
+  "displayName": "Jireh Temple",
+  "status": "active",
+  "managedBy": "churchdome",
+  "workerName": "churchdome-jireh",
+  "database": {
+    "name": "churchdome-jireh-db",
+    "id": "64a9b1f3-7092-49ac-8e5c-8040b2ac1edd"
+  },
+  "bucket": "churchdome-jireh-media",
+  "url": "https://churchdome-jireh.ephesians200.workers.dev",
+  "vars": {
+    "CHURCH_NAME": "Jireh Temple",
+    "CHURCH_GROUPS": "Men,Women,Youth,Children",
+    "APP_SCHEME": "royalhousejireh",
+    "APP_PACKAGE": "com.churchdome.royalhousejireh",
+    "WEB_ORIGIN": ""
+  },
+  "createdAt": "2026-11-01T20:26:01.694Z"
+}
